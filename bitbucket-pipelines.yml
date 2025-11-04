@@ -1,0 +1,85 @@
+image: atlassian/default-image:3
+
+definitions:
+  caches:
+    node: ~/.npm
+
+  steps:
+    - step: &ci_step
+        name: Build & Test (main)
+        image: node:18-alpine
+        caches:
+          - node
+        script:
+          - node -v && npm -v
+          - npm ci --ignore-scripts
+          - npm run lint || true
+          - npm run test || true
+          - npm run build
+
+    - step: &docker_build_package
+        name: Docker Build & Package (no registry)
+        services:
+          - docker
+        script:
+          - export IMAGE_NAME="test-repo"
+          - export IMAGE_TAG="main-${BITBUCKET_COMMIT:0:7}"
+          # Build for typical x86_64 servers
+          - docker build --platform linux/amd64 -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+          # Package the image for transfer
+          - docker save "${IMAGE_NAME}:${IMAGE_TAG}" | gzip > image.tgz
+          - echo "${IMAGE_NAME}" > image_name.txt
+          - echo "${IMAGE_TAG}" > image_tag.txt
+        artifacts:
+          - image.tgz
+          - image_name.txt
+          - image_tag.txt
+
+    - step: &deploy_staging
+        name: Deploy to Staging (no registry)
+        deployment: staging
+        script:
+          - export IMAGE_NAME=$(cat image_name.txt)
+          - export IMAGE_TAG=$(cat image_tag.txt)
+          # copy image bundle to server
+          - scp -o StrictHostKeyChecking=yes image.tgz ${STAGING_SSH_USER}@${STAGING_HOST}:/tmp/image.tgz
+          # load & run on server
+          - pipe: atlassian/ssh-run:0.6.2
+            variables:
+              SSH_USER: "${STAGING_SSH_USER}"
+              SERVER: "${STAGING_HOST}"
+              COMMAND: |
+                set -e
+                gunzip -c /tmp/image.tgz | docker load
+                docker rm -f test-repo || true
+                docker run -d --name test-repo -p 3002:3002 --restart unless-stopped "${IMAGE_NAME}:${IMAGE_TAG}"
+
+    - step: &deploy_production
+        name: Deploy to Production (no registry)
+        deployment: production
+        trigger: manual
+        script:
+          - export IMAGE_NAME=$(cat image_name.txt)
+          - export IMAGE_TAG=$(cat image_tag.txt)
+          - scp -o StrictHostKeyChecking=yes image.tgz ${PRODUCTION_SSH_USER}@${PRODUCTION_HOST}:/tmp/image.tgz
+          - pipe: atlassian/ssh-run:0.6.2
+            variables:
+              SSH_USER: "${PRODUCTION_SSH_USER}"
+              SERVER: "${PRODUCTION_HOST}"
+              COMMAND: |
+                set -e
+                gunzip -c /tmp/image.tgz | docker load
+                docker rm -f test-repo || true
+                docker run -d --name test-repo -p 3003:3003 --restart unless-stopped "${IMAGE_NAME}:${IMAGE_TAG}"
+
+pipelines:
+  branches:
+    main:
+      - step: *ci_step
+      - step: *docker_build_package
+      - step: *deploy_staging
+      - step: *deploy_production
+
+services:
+  docker:
+    memory: 3072
